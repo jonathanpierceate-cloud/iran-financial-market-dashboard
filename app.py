@@ -597,7 +597,7 @@ def render_tse_tab():
             if old_net:
                 change_pct = (net - old_net) / abs(old_net) * 100
                 net_delta = f"{change_pct:+.2f}%"
-        f1.metric("خالص ورود/خروج پول حقیقی امروز (میلیارد تومان)", f"{net / 1_000_000_000:+,.2f}", net_delta,
+        f1.metric("خالص ورود/خروج پول حقیقی امروز", f"{net / 1_000_000_000:+,.2f}", net_delta,
                   delta_description=f"درصد تغییر جهت‌دار نسبت به جلسهٔ {old_date}" if previous and old_net else "برای محاسبهٔ درصد، خالص روز قبل باید غیرصفر باشد")
         f2.metric("نمادهای با ورود خالص حقیقی", f"{len(inflow_symbols):,}", daily_delta("tse.inflow_count", len(inflow_symbols), percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
         f3.metric("نمادهای با خروج خالص حقیقی", f"{len(outflow_symbols):,}", daily_delta("tse.outflow_count", len(outflow_symbols), percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
@@ -614,11 +614,11 @@ def render_tse_tab():
             else:
                 top = frame.assign(flow_display=frame["flow_toman"].map(lambda value: f"{value / 1_000_000_000:+,.2f}"))
                 top = top.sort_values("flow_toman", ascending=ascending).head(5)
-                col.dataframe(top[["symbol", "flow_display"]].rename(columns={"symbol": "نماد", "flow_display": "جریان خالص حقیقی (میلیارد تومان)"}).reset_index(drop=True),
+                col.dataframe(top[["symbol", "flow_display"]].rename(columns={"symbol": "نماد", "flow_display": "جریان خالص حقیقی"}).reset_index(drop=True),
                               width="stretch", hide_index=True)
         if previous:
             st.caption(f"مقایسهٔ تغییر جریان خالص با جلسهٔ ثبت‌شدهٔ قبل: {old_date}؛ در مبنا {old_count:,} نماد دارای داده بودند.")
-        st.caption(f"روش برآورد: (حجم خرید حقیقی − حجم فروش حقیقی) × آخرین قیمت، تبدیل ریال به تومان · {market['flow_count']:,} نماد با دادهٔ حقیقی. برآورد، خالص انتقال بین حقیقی و حقوقی است و به‌معنای برداشت وجه از کل بازار نیست.")
+        st.caption(f"روش برآورد: (حجم خرید حقیقی − حجم فروش حقیقی) × آخرین قیمت · {market['flow_count']:,} نماد با دادهٔ حقیقی. مقادیر جریان در کارت و جدول بر حسب میلیارد نمایش داده می‌شوند. برآورد، خالص انتقال بین حقیقی و حقوقی است و به‌معنای برداشت وجه از کل بازار نیست.")
     else:
         st.info("آمار حقیقی برای محاسبهٔ جریان پول در دسترس نیست.")
 
