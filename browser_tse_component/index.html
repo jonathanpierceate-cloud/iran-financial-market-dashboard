@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;font:12px sans-serif;color:#ddd;background:transparent">
+<div id="status" role="status" aria-live="polite"></div>
+<script>
+(() => {
+  const API = "https://cdn.tsetmc.com/api";
+  const status = document.getElementById("status");
+  let latestArgs = {};
+  let refreshKey = null;
+  let navSignature = null;
+  let state = {refresh_key: null, primary: null, nav: {}, errors: {}, fetched_at: null};
+
+  function send() {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: state,
+      dataType: "json"
+    }, "*");
+  }
+
+  function arrayAt(data, keys) {
+    for (const key of keys) if (Array.isArray(data && data[key])) return data[key];
+    return Array.isArray(data) ? data : [];
+  }
+
+  async function fetchJson(url) {
+    const response = await fetch(url, {method: "GET", mode: "cors", credentials: "omit", cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  }
+
+  function watchUrl() {
+    const params = new URLSearchParams({market: "0", withBestLimits: "true", hEven: "0", RefID: "0"});
+    for (let i = 0; i < 9; i++) params.set(`paperTypes[${i}]`, String(i + 1));
+    return `${API}/ClosingPrice/GetMarketWatch?${params.toString()}`;
+  }
+
+  async function loadPrimary(key) {
+    status.textContent = "دریافت مستقیم داده‌های بورس از مرورگر…";
+    const urls = {
+      watch: watchUrl(),
+      clients: `${API}/ClientType/GetClientTypeAll`,
+      indexes: `${API}/Index/GetIndexB1LastAll/SelectedIndexes/1`,
+      overview: `${API}/MarketData/GetMarketOverview/1`
+    };
+    const entries = await Promise.all(Object.entries(urls).map(async ([name, url]) => {
+      try { return [name, await fetchJson(url), null]; }
+      catch (error) { return [name, null, String(error && error.message || error)]; }
+    }));
+    const raw = Object.fromEntries(entries.map(([name, data]) => [name, data]));
+    const errors = Object.fromEntries(entries.filter(([, , error]) => error).map(([name, , error]) => [name, error]));
+    const allMarket = arrayAt(raw.watch, ["marketwatch", "marketWatch", "marketWatchDto"]);
+    const market = allMarket.filter(row => [300, 303, 305].includes(Number(row.yVal)));
+    const codes = new Set(market.map(row => String(row.insCode)));
+    const allClients = arrayAt(raw.clients, ["clientTypeAllDto", "clientTypeAll"]);
+    const clients = allClients.filter(row => codes.has(String(row.insCode)));
+    const compactMarket = market.map(row => ({
+      insCode: row.insCode, lva: row.lva, lvc: row.lvc, yVal: row.yVal,
+      pdv: row.pdv, pcl: row.pcl, py: row.py, pf: row.pf, qtj: row.qtj,
+      bv: row.bv, ztt: row.ztt, pMax: row.pMax, pMin: row.pMin,
+      blDs: Array.isArray(row.blDs) ? row.blDs.slice(0, 1).map(book => ({qmd: book.qmd, qmo: book.qmo, pmd: book.pmd, pmo: book.pmo})) : []
+    }));
+    const compactClients = clients.map(row => ({
+      insCode: row.insCode, buy_I_Volume: row.buy_I_Volume, buy_CountI: row.buy_CountI,
+      sell_I_Volume: row.sell_I_Volume, sell_CountI: row.sell_CountI
+    }));
+    const indexRows = arrayAt(raw.indexes, ["indexB1", "indexB1LastAll"]);
+    const summary = raw.overview && raw.overview.marketOverview || {};
+    state = {
+      refresh_key: key,
+      primary: {watch: {marketwatch: compactMarket}, clients: {clientTypeAllDto: compactClients},
+        indexes: {indexB1: indexRows}, overview: {marketOverview: {
+          marketActivityDEven: summary.marketActivityDEven,
+          indexLastValue: summary.indexLastValue,
+          indexChange: summary.indexChange
+        }}},
+      nav: {}, nav_signature: null, errors, fetched_at: new Date().toISOString()
+    };
+    refreshKey = JSON.stringify(key);
+    navSignature = null;
+    status.textContent = Object.keys(errors).length ? "دریافت بورس از مرورگر با خطای بخشی انجام شد." : `دادهٔ بورس از مرورگر دریافت شد · ${market.length.toLocaleString("fa-IR")} نماد`;
+    send();
+    await loadNav(latestArgs.nav_codes || []);
+  }
+
+  async function loadNav(codes) {
+    if (!state.primary || !Array.isArray(codes)) return;
+    const selected = [...new Set(codes.map(String))].slice(0, 50);
+    const signature = selected.join(",");
+    if (signature === navSignature) return;
+    navSignature = signature;
+    const entries = await Promise.all(selected.map(async code => {
+      try {
+        const data = await fetchJson(`${API}/Fund/GetETFByInsCode/${encodeURIComponent(code)}`);
+        const item = data && data.etf || {};
+        return [code, {date: item.deven == null ? null : String(item.deven), redemption: item.pRedTran || null,
+          subscription: item.pSubTran || null}, null];
+      } catch (error) { return [code, null, String(error && error.message || error)]; }
+    }));
+    state.nav = Object.fromEntries(entries.filter(([, value]) => value).map(([code, value]) => [code, value]));
+    state.nav_signature = signature;
+    const navErrors = entries.filter(([, , error]) => error);
+    if (navErrors.length) state.errors.nav = `${navErrors.length} NAV request(s) failed`;
+    send();
+  }
+
+  function onRender(event) {
+    const args = event.data && event.data.args || {};
+    latestArgs = args;
+    const nextKey = JSON.stringify(args.refresh_key);
+    if (nextKey !== refreshKey) {
+      loadPrimary(args.refresh_key).catch(error => {
+        state = {refresh_key: args.refresh_key, primary: null, nav: {}, errors: {browser: String(error)}, fetched_at: new Date().toISOString()};
+        status.textContent = `خطای دریافت از مرورگر: ${String(error && error.message || error)}`;
+        send();
+      });
+    } else {
+      loadNav(args.nav_codes || []).catch(error => {
+        state.errors.nav = String(error && error.message || error); send();
+      });
+    }
+  }
+
+  window.addEventListener("message", event => {
+    if (event.data && event.data.type === "streamlit:render") onRender(event);
+  });
+  window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1}, "*");
+  window.parent.postMessage({isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: 26}, "*");
+})();
+</script>
+</body>
+</html>
