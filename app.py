@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ------------------------------- Page setup -------------------------------
 st.set_page_config(page_title="داشبورد بازارهای مالی ایران", page_icon="📊", layout="wide")
@@ -28,9 +28,11 @@ h1,h2,h3,p{ text-align:right }
 """, unsafe_allow_html=True)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36", "Accept": "application/json,text/html,*/*"}
-TSE = "https://cdn.tsetmc.com/api"
 TROY_OUNCE_GRAMS = 31.1034768
 DB_PATH = Path(__file__).with_name("market_flow.sqlite3")
+browser_tse_feed = components.declare_component(
+    "browser_tse_feed", path=str(Path(__file__).with_name("browser_tse_component"))
+)
 
 
 def http_get(url: str, params: dict | None = None, timeout: int = 15):
@@ -221,39 +223,21 @@ def get_tgju(profile: str):
         return None, str(exc)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_price_limits(ins_code: str):
-    data, error = json_get(f"{TSE}/Instrument/GetInstrumentInfo/{ins_code}")
-    if error:
-        return None, None
-    info = data.get("instrumentInfo", {}) if isinstance(data, dict) else {}
-    threshold = info.get("staticThreshold", {}) if isinstance(info, dict) else {}
-    upper = num(threshold, "psGelStaMax")
-    lower = num(threshold, "psGelStaMin")
-    return upper or None, lower or None
+def get_tse_data(browser_data: dict | None):
+    """Parse TSETMC replies fetched directly by the visitor's browser."""
+    errors = (browser_data or {}).get("errors", {}) if isinstance(browser_data, dict) else {}
+    primary = (browser_data or {}).get("primary") if isinstance(browser_data, dict) else None
+    if not isinstance(primary, dict):
+        details = "؛ ".join(f"{key}: {value}" for key, value in errors.items()) if errors else ""
+        return {"symbols": pd.DataFrame(), "index": None, "index_pct": None,
+                "date": datetime.now().strftime("%Y%m%d"), "net_flow_toman": None,
+                "flow_count": 0, "nav_candidates": [],
+                "error": details or "در انتظار دریافت دادهٔ TSETMC از مرورگر شما هستیم."}
 
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_etf_nav(ins_code: str):
-    """Fetch today's ETF redemption/subscription NAV from TSETMC."""
-    data, error = json_get(f"{TSE}/Fund/GetETFByInsCode/{ins_code}")
-    if error:
-        return {"date": None, "redemption": None, "subscription": None}
-    etf = data.get("etf", {}) if isinstance(data, dict) else {}
-    if not isinstance(etf, dict):
-        return {"date": None, "redemption": None, "subscription": None}
-    return {"date": str(int(num(etf, "deven"))) if num(etf, "deven") else None,
-            "redemption": num(etf, "pRedTran") or None,
-            "subscription": num(etf, "pSubTran") or None}
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_tse_data():
-    params = {"market": 0, **{f"paperTypes[{i}]": i + 1 for i in range(9)}, "withBestLimits": "true", "hEven": 0, "RefID": 0}
-    watch, ew = json_get(f"{TSE}/ClosingPrice/GetMarketWatch", params)
-    clients, ec = json_get(f"{TSE}/ClientType/GetClientTypeAll")
-    indexes, ei = json_get(f"{TSE}/Index/GetIndexB1LastAll/SelectedIndexes/1")
-    overview, eo = json_get(f"{TSE}/MarketData/GetMarketOverview/1")
+    watch = primary.get("watch", {})
+    clients = primary.get("clients", {})
+    indexes = primary.get("indexes", {})
+    overview = primary.get("overview", {})
     market_rows = payload_rows(watch, "marketwatch", "marketWatch", "marketWatchDto")
     client_rows = payload_rows(clients, "clientTypeAllDto", "clientTypeAll")
     index_rows = payload_rows(indexes, "indexB1", "indexB1LastAll")
@@ -269,19 +253,19 @@ def get_tse_data():
         index_pct = change / (index_value - change) * 100 if index_value and index_value != change else None
     date = str(int(num(summary, "marketActivityDEven"))) if num(summary, "marketActivityDEven") else datetime.now().strftime("%Y%m%d")
     if not market_rows:
-        errors = [message for message in (ew, ec, ei, eo) if message]
+        details = "؛ ".join(f"{key}: {value}" for key, value in errors.items()) if errors else ""
         return {"symbols": pd.DataFrame(), "index": index_value, "index_pct": index_pct, "date": date,
-                "net_flow_toman": None, "flow_count": 0, "error": "؛ ".join(errors) or "دیده‌بان خالی است."}
+                "net_flow_toman": None, "flow_count": 0, "nav_candidates": [],
+                "error": details or "مرورگر دادهٔ دیده‌بان TSETMC را دریافت نکرد."}
 
+    nav_map = browser_data.get("nav", {}) if isinstance(browser_data.get("nav"), dict) else {}
     records = []
     net_flow_rial = 0.0
     flow_count = 0
-    needs_limits = []
     for row in market_rows:
         try:
             code = str(row.get("insCode", ""))
             client = client_map.get(code, {})
-            # Current TSETMC MarketWatch DTO uses short keys (pdv/pcl/qtj/ztt).
             last = num(row, "pdv", "pDrCotVal", "last")
             close = num(row, "pcl", "pClosing", "closingPrice", "close")
             yesterday = num(row, "py", "priceYesterday", "yesterdayPrice")
@@ -302,8 +286,6 @@ def get_tse_data():
             real_buy_pct = buy_volume / volume * 100 if volume else 0.0
             yval = int(num(row, "yVal"))
             etf = yval == 305
-            # ETF base volume is often 1, so score fund liquidity by actual
-            # trade activity instead of the stock base-volume rule.
             liquidity_score = (20 if trades > 50 and volume > 0 else 0) if etf else (20 if base_volume and volume >= base_volume else 0)
             score = (25 if power >= 1.5 else 0) + (15 if power >= 2.5 else 0) + (15 if real_buy_pct >= 65 else 0)
             score += liquidity_score + (15 if close and last >= close else 0) + (10 if first and last > first else 0)
@@ -311,66 +293,52 @@ def get_tse_data():
             top = book[0] if book and isinstance(book[0], dict) else {}
             bid_volume = num(top, "qmd")
             ask_volume = num(top, "qmo")
-            # Only request static price bands for queue candidates that need the queue rule.
-            buy_needs_limit = trades > 50 and base_volume > 0 and volume >= base_volume and power >= 1 and last_pct - close_pct < 1.5 and bid_volume > 0 and ask_volume == 0 and bool(code)
-            sell_needs_limit = trades > 50 and seller_power > 1 and close_pct - last_pct < 1.5 and ask_volume > 0 and bid_volume == 0 and bool(code)
-            if buy_needs_limit or sell_needs_limit:
-                needs_limits.append((code, buy_needs_limit, sell_needs_limit))
+            upper_limit = num(row, "pMax")
+            lower_limit = num(row, "pMin")
+            buy_locked = bool(trades > 50 and base_volume > 0 and volume >= base_volume and power >= 1 and
+                               bid_volume > 0 and ask_volume == 0 and upper_limit and abs(last - upper_limit) < 0.001)
+            sell_locked = bool(trades > 50 and seller_power > 1 and ask_volume > 0 and bid_volume == 0 and
+                                lower_limit and abs(last - lower_limit) < 0.001)
             name = str(row.get("lva") or row.get("lVal18AFC") or code)
             full_name = str(row.get("lvc") or row.get("lVal30") or "")
-            # Listed shares and ETFs only; omit options, commodity contracts and debt instruments.
             market_eligible = yval in {300, 303, 305}
             flow_toman = None
             if market_eligible and volume > 0 and last > 0 and code in client_map:
                 flow_toman = (buy_volume - sell_volume) * last / 10
                 net_flow_rial += flow_toman * 10
                 flow_count += 1
+            nav = nav_map.get(code, {}) if etf else {}
+            nav_date = str(nav.get("date")) if isinstance(nav, dict) and nav.get("date") else None
+            nav_redemption = num(nav, "redemption") if isinstance(nav, dict) else 0
+            nav_redemption = nav_redemption if nav_date == date and nav_redemption else None
+            nav_subscription = num(nav, "subscription") if isinstance(nav, dict) else 0
+            nav_subscription = nav_subscription if nav_date == date and nav_subscription else None
             records.append({"code": code, "symbol": name, "full_name": full_name, "market_eligible": market_eligible, "yval": yval,
-                            "last_pct": last_pct, "close_pct": close_pct,
-                            "last": last, "close": close, "first": first, "volume": volume, "base": base_volume,
-                            "trades": trades, "buy_volume": buy_volume, "sell_volume": sell_volume, "power": power,
-                            "seller_power": seller_power, "buy_pct": real_buy_pct, "score": score, "etf": etf, "flow_toman": flow_toman,
-                            "etf_nav_redemption": None, "etf_nav_subscription": None, "etf_nav_pct": None,
-                            "bid_volume": bid_volume, "ask_volume": ask_volume, "buy_locked": False, "sell_locked": False})
+                            "last_pct": last_pct, "close_pct": close_pct, "last": last, "close": close, "first": first,
+                            "volume": volume, "base": base_volume, "trades": trades, "buy_volume": buy_volume,
+                            "sell_volume": sell_volume, "power": power, "seller_power": seller_power,
+                            "buy_pct": real_buy_pct, "score": score, "etf": etf, "flow_toman": flow_toman,
+                            "etf_nav_redemption": nav_redemption, "etf_nav_subscription": nav_subscription,
+                            "etf_nav_pct": (last / nav_redemption - 1) * 100 if nav_redemption else None,
+                            "bid_volume": bid_volume, "ask_volume": ask_volume,
+                            "buy_locked": buy_locked, "sell_locked": sell_locked})
         except (TypeError, ValueError, ZeroDivisionError):
             continue
 
-    # A locked queue is accepted only when the last price matches the instrument's actual daily limit.
-    limit_map = {}
-    if needs_limits:
-        codes = list(dict.fromkeys(item[0] for item in needs_limits))
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            limit_map.update(zip(codes, pool.map(get_price_limits, codes)))
-        by_code = {item[0]: item[1:] for item in needs_limits}
-        for record in records:
-            flags = by_code.get(record["code"])
-            if not flags:
-                continue
-            upper, lower = limit_map.get(record["code"], (None, None))
-            record["buy_locked"] = bool(flags[0] and upper and abs(record["last"] - upper) < 0.001)
-            record["sell_locked"] = bool(flags[1] and lower and abs(record["last"] - lower) < 0.001)
-
-    # Pull NAV only for ETFs already passing all live trading/flow rules, to
-    # keep requests low. A stale/missing NAV can never emit an ETF buy signal.
-    etf_nav_candidates = [record for record in records if record["etf"] and record["score"] >= 60 and
-                          record["trades"] > 50 and record["volume"] > 0 and record["power"] >= 1.5 and
-                          record["buy_pct"] >= 65 and record["last"] >= record["close"] and
-                          record["first"] > 0 and record["last"] > record["first"] and
-                          record["buy_volume"] > record["sell_volume"] and
-                          record["last_pct"] >= record["close_pct"]]
-    if etf_nav_candidates:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            nav_rows = list(pool.map(get_etf_nav, [record["code"] for record in etf_nav_candidates]))
-        for record, nav in zip(etf_nav_candidates, nav_rows):
-            if nav["date"] == date and nav["redemption"]:
-                record["etf_nav_redemption"] = nav["redemption"]
-                record["etf_nav_subscription"] = nav["subscription"]
-                record["etf_nav_pct"] = (record["last"] / nav["redemption"] - 1) * 100
-
-    errors = [message for message in (ew, ec, ei, eo) if message]
+    nav_candidates = [record for record in records if record["etf"] and record["score"] >= 60 and
+                      record["trades"] > 50 and record["volume"] > 0 and record["power"] >= 1.5 and
+                      record["buy_pct"] >= 65 and record["last"] >= record["close"] and
+                      record["first"] > 0 and record["last"] > record["first"] and
+                      record["buy_volume"] > record["sell_volume"] and record["last_pct"] >= record["close_pct"]]
+    nav_candidates.sort(key=lambda record: (record["score"], record["power"], record["trades"]), reverse=True)
+    nav_candidates = [record["code"] for record in nav_candidates[:50]]
+    error_text = "؛ ".join(f"{key}: {value}" for key, value in errors.items()) if errors else None
+    if nav_candidates and not all(code in nav_map for code in nav_candidates):
+        error_text = (error_text + "؛ " if error_text else "") + "در انتظار دریافت NAV صندوق‌ها از مرورگر."
     return {"symbols": pd.DataFrame(records), "index": index_value, "index_pct": index_pct, "date": date,
             "net_flow_toman": net_flow_rial / 10, "flow_count": flow_count,
-            "error": "؛ ".join(errors) if errors else None}
+            "nav_candidates": nav_candidates, "error": error_text,
+            "browser_fetched_at": browser_data.get("fetched_at")}
 
 
 # ------------------------- Daily flow persistence -------------------------
@@ -409,13 +377,13 @@ def render_stock_table(frame: pd.DataFrame, is_etf: bool = False):
 
 # ------------------------------ UI sections -------------------------------
 st.title("📊 داشبورد بازارهای مالی ایران")
-st.caption("فیلترها و قیمت‌های زنده از منابع عمومی بازار · کش داده ۶۰ ثانیه")
+st.caption("فیلترها و قیمت‌های زنده از منابع عمومی بازار · بروزرسانی ۶۰ ثانیه‌ای · دادهٔ بورس از مرورگر بازدیدکننده دریافت می‌شود")
 if st.button("🔄 بروزرسانی لحظه‌ای داده‌ها", type="primary"):
     get_usdt.clear()
     get_rahavard_gold.clear()
     get_ounce_fallback.clear()
     get_tgju.clear()
-    get_tse_data.clear()
+    st.session_state["_tse_manual_refresh"] = st.session_state.get("_tse_manual_refresh", 0) + 1
     st.rerun()
 
 tab_tse, tab_gold = st.tabs(["🏛️ بورس تهران (TSETMC)", "🥇 بازار طلا، سکه و ارز"])
@@ -468,7 +436,18 @@ with tab_gold:
 @st.fragment(run_every="60s")
 def render_tse_tab():
     st.subheader("فیلتر نمادها و برآورد جهت بازار فردا")
-    market = get_tse_data()
+    refresh_key = f"{int(datetime.now().timestamp() // 60)}:{st.session_state.get('_tse_manual_refresh', 0)}"
+    nav_codes = st.session_state.get("_tse_nav_candidates", [])
+    browser_data = browser_tse_feed(refresh_key=refresh_key, nav_codes=nav_codes, default=None,
+                                    key="tsetmc-browser-feed")
+    if isinstance(browser_data, dict) and browser_data.get("refresh_key") == refresh_key:
+        market = get_tse_data(browser_data)
+        discovered = market.get("nav_candidates", [])
+        if discovered != nav_codes:
+            st.session_state["_tse_nav_candidates"] = discovered
+            st.rerun()
+    else:
+        market = get_tse_data(None)
     symbols = market["symbols"]
     k1, k2, k3 = st.columns(3)
     k1.metric("شاخص کل", fmt(market["index"]))
@@ -478,8 +457,10 @@ def render_tse_tab():
     if market["error"]:
         st.warning("بخشی از داده دریافت نشد: " + market["error"])
     if symbols.empty:
-        st.info("دادهٔ TSETMC در دسترس نیست. سرور داخلی باید به CDN بورس دسترسی شبکه داشته باشد.")
+        st.info("در انتظار دریافت دیده‌بان، شاخص و اطلاعات حقیقی TSETMC از مرورگر بازدیدکننده هستیم. مرورگر باید بتواند cdn.tsetmc.com را باز کند.")
         return
+    if market.get("browser_fetched_at"):
+        st.caption(f"دادهٔ بورس مستقیماً از مرورگر دریافت شد · زمان دریافت: {market['browser_fetched_at']}")
 
     pressure_buy = equity_market[(equity_market["trades"] > 50) & (equity_market["base"] > 0) & (equity_market["volume"] >= equity_market["base"]) &
                                  (((equity_market["last_pct"] - equity_market["close_pct"]) >= 1.5) | equity_market["buy_locked"]) & (equity_market["power"] >= 1)]
