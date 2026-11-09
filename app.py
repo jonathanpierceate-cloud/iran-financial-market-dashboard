@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -82,6 +83,35 @@ def fmt(value, digits: int = 0) -> str:
 
 def rial_to_toman(value):
     return None if value is None else value / 10
+
+
+def daily_delta(key: str, value, *, unit: str = "%", percentage: bool = True):
+    """Return a Streamlit delta against this browser session's last value yesterday.
+
+    Keep today's value fresh on reruns so it becomes yesterday's final observed
+    value after the date rolls over. Never imply a comparison when a day is missing.
+    """
+    if value is None:
+        return None
+    try:
+        current = float(value)
+    except (TypeError, ValueError):
+        return None
+    today = datetime.now().date().isoformat()
+    snapshots = st.session_state.setdefault("_daily_metric_snapshots", {})
+    previous = snapshots.get(key)
+    delta = None
+    if previous and previous.get("date") == (datetime.now().date() - timedelta(days=1)).isoformat():
+        old = previous.get("value")
+        if old is not None:
+            change = current - float(old)
+            if percentage:
+                change = change / abs(float(old)) * 100 if float(old) else None
+                delta = f"{change:+.2f}%" if change is not None else None
+            else:
+                delta = f"{change:+,.2f} {unit}"
+    snapshots[key] = {"date": today, "value": current}
+    return delta
 
 
 # --------------------------------- Markets ---------------------------------
@@ -162,6 +192,61 @@ def get_usdt():
             errors.append(str(exc))
     return {"toman": None, "high24": None, "low24": None, "volume24": None,
             "rial": None, "source": "ناموجود", "error": "؛ ".join(errors[-3:])}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_tgju_previous_daily_close(profile: str):
+    """Return the latest completed TGJU daily candle (prices are in rial)."""
+    url = f"https://api.tgju.org/v1/market/indicator/summary-table-data/{profile}"
+    data, error = json_get(url)
+    if error:
+        return {"close": None, "date": None, "error": error}
+    try:
+        today = datetime.now(ZoneInfo("Asia/Tehran")).date()
+        for row in data.get("data", []):
+            if len(row) < 7:
+                continue
+            candle_date = datetime.strptime(str(row[6]), "%Y/%m/%d").date()
+            if candle_date < today:
+                close = float(str(row[3]).replace(",", ""))
+                if close > 0:
+                    return {"close": close, "date": candle_date.isoformat(), "error": None}
+        return {"close": None, "date": None, "error": "کندل روزانهٔ بسته‌شده در تاریخچه پیدا نشد."}
+    except (AttributeError, TypeError, ValueError, IndexError) as exc:
+        return {"close": None, "date": None, "error": str(exc)}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_previous_ounce_daily_close():
+    """Return the last completed COMEX gold futures daily candle from Yahoo."""
+    response = http_get("https://query1.finance.yahoo.com/v8/finance/chart/GC=F",
+                        {"range": "5d", "interval": "1d"})
+    if isinstance(response, Exception):
+        return {"close": None, "date": None, "error": str(response)}
+    try:
+        result = response.json()["chart"]["result"][0]
+        quote = result["indicators"]["quote"][0]
+        zone = ZoneInfo(result["meta"].get("exchangeTimezoneName", "America/New_York"))
+        active_date = datetime.now(zone).date()
+        candles = []
+        for stamp, close in zip(result.get("timestamp", []), quote.get("close", [])):
+            if close is None:
+                continue
+            candle_date = datetime.fromtimestamp(stamp, zone).date()
+            if candle_date < active_date:
+                candles.append((candle_date, float(close)))
+        if not candles:
+            return {"close": None, "date": None, "error": "کندل روزانهٔ بسته‌شدهٔ انس پیدا نشد."}
+        candle_date, close = candles[-1]
+        return {"close": close, "date": candle_date.isoformat(), "error": None}
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return {"close": None, "date": None, "error": str(exc)}
+
+
+def change_from_close(current, previous, digits: int = 2):
+    if current is None or previous in (None, 0):
+        return None
+    return f"{(float(current) / float(previous) - 1) * 100:+.{digits}f}%"
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -378,6 +463,7 @@ def render_stock_table(frame: pd.DataFrame, is_etf: bool = False):
 # ------------------------------ UI sections -------------------------------
 st.title("📊 داشبورد بازارهای مالی ایران")
 st.caption("فیلترها و قیمت‌های زنده از منابع عمومی بازار · بروزرسانی ۶۰ ثانیه‌ای · دادهٔ بورس از مرورگر بازدیدکننده دریافت می‌شود")
+st.caption("دلتاهای قیمت از کندل روزانهٔ بسته‌شدهٔ قبل محاسبه می‌شوند؛ دلتاهای شمارش فیلترها و جریان حقیقی به سابقهٔ نشست در روز قبل نیاز دارند.")
 if st.button("🔄 بروزرسانی لحظه‌ای داده‌ها", type="primary"):
     get_usdt.clear()
     get_rahavard_gold.clear()
@@ -403,20 +489,35 @@ with tab_gold:
         local_rial, local_error = get_tgju("geram18")
     local_toman = rial_to_toman(local_rial)
     intrinsic_toman = (ounce_usd * rate_toman / TROY_OUNCE_GRAMS * 0.750) if ounce_usd and rate_toman else None
+    previous_ounce = get_previous_ounce_daily_close()
+    previous_gold = get_tgju_previous_daily_close("geram18")
+    previous_usd = get_tgju_previous_daily_close("price_dollar_rl")
+    previous_gold_toman = rial_to_toman(previous_gold["close"])
+    previous_usd_toman = rial_to_toman(previous_usd["close"])
+    previous_intrinsic = (
+        previous_ounce["close"] * previous_usd_toman / TROY_OUNCE_GRAMS * 0.750
+        if previous_ounce["close"] and previous_usd_toman else None
+    )
     a, b, c = st.columns(3)
-    a.metric("انس جهانی از ره‌آورد (دلار/اونس)", fmt(ounce_usd, 2))
-    b.metric("طلای ۱۸ عیار داخل (تومان/گرم)", fmt(local_toman))
-    c.metric("نرخ دلار/تتر (تومان)", fmt(rate_toman))
+    a.metric("انس جهانی از ره‌آورد (دلار/اونس)", fmt(ounce_usd, 2), change_from_close(ounce_usd, previous_ounce["close"]), delta_description=f"نسبت به کندل بسته‌شدهٔ {previous_ounce['date'] or 'ناموجود'} · Yahoo GC=F")
+    b.metric("طلای ۱۸ عیار داخل (تومان/گرم)", fmt(local_toman), change_from_close(local_toman, previous_gold_toman), delta_description=f"نسبت به کندل بسته‌شدهٔ {previous_gold['date'] or 'ناموجود'} · TGJU")
+    c.metric("نرخ دلار/تتر (تومان)", fmt(rate_toman), change_from_close(rate_toman, previous_usd_toman), delta_description=f"مبنای دلتا: کندل دلار آزاد TGJU در {previous_usd['date'] or 'ناموجود'}؛ قیمت فعلی از تبدیل است")
     st.caption(f"منبع انس: {ounce_source or 'ناموجود'} · منبع قیمت داخلی: {local_source} · منبع دلار/تتر: {fx['source']} · زمان پاسخ ره‌آورد: {rah['ounce_time'] or '—'}")
+    st.caption("درصدهای کنار کارت‌های قیمت از آخرین کندل روزانهٔ بسته‌شده محاسبه می‌شوند. نرخ روز قبل دلار از کندل دلار آزاد TGJU است؛ چون API عمومی تبدیل در مستنداتش کندل روزانهٔ USDT/IRT ارائه نمی‌کند.")
     st.info("نرخ دلار/تتر در همین بخش برای تبدیل ارزش جهانی طلا استفاده می‌شود. API عمومی تبدیل آمار تجمیعی سقف، کف و حجم ۲۴ساعته را ارائه نمی‌کند.")
     if fx["error"]:
         st.warning(fx["error"])
     if intrinsic_toman is not None:
-        st.metric("ارزش محاسباتی طلای ۱۸ عیار جهانی (تومان/گرم)", fmt(intrinsic_toman))
+        st.metric("ارزش محاسباتی طلای ۱۸ عیار جهانی (تومان/گرم)", fmt(intrinsic_toman), change_from_close(intrinsic_toman, previous_intrinsic), delta_description=f"تغییر بر پایهٔ انس {previous_ounce['date'] or 'ناموجود'} و دلار {previous_usd['date'] or 'ناموجود'}")
         if local_toman is not None:
             bubble_toman = local_toman - intrinsic_toman
             bubble_pct = bubble_toman / intrinsic_toman * 100 if intrinsic_toman else 0
-            st.metric("حباب/اختلاف بازار ایران با ارزش جهانی", f"{bubble_toman:+,.0f} تومان", f"{bubble_pct:+.2f}%")
+            previous_bubble_pct = (
+                (previous_gold_toman - previous_intrinsic) / previous_intrinsic * 100
+                if previous_gold_toman is not None and previous_intrinsic else None
+            )
+            bubble_delta = f"{bubble_pct - previous_bubble_pct:+.2f} واحد درصد" if previous_bubble_pct is not None else None
+            st.metric("حباب/اختلاف بازار ایران با ارزش جهانی", f"{bubble_toman:+,.0f} تومان", bubble_delta, delta_description=f"تغییر حباب نسبت به کندل‌های قبلی: طلا {previous_gold['date'] or 'ناموجود'} · انس {previous_ounce['date'] or 'ناموجود'}")
             if bubble_pct > 0:
                 st.warning(f"قیمت داخلی حدود {bubble_pct:.2f}٪ بالاتر از ارزش محاسباتی جهانی است.")
             elif bubble_pct < 0:
@@ -450,10 +551,11 @@ def render_tse_tab():
         market = get_tse_data(None)
     symbols = market["symbols"]
     k1, k2, k3 = st.columns(3)
-    k1.metric("شاخص کل", fmt(market["index"]))
+    k1.metric("شاخص کل", fmt(market["index"]), f"{market['index_pct']:+.2f}%" if market["index_pct"] is not None else None, delta_description="تغییر از قیمت پایانی کندل قبلی TSETMC")
     k2.metric("تغییر روزانه شاخص", f"{market['index_pct']:+.2f}%" if market["index_pct"] is not None else "—")
     equity_market = symbols[symbols["market_eligible"]] if not symbols.empty else symbols
-    k3.metric("نمادهای سهام و ETF دارای معامله", f"{int((equity_market['volume'] > 0).sum()):,}" if not equity_market.empty else "—")
+    active_count = int((equity_market["volume"] > 0).sum()) if not equity_market.empty else None
+    k3.metric("نمادهای سهام و ETF دارای معامله", fmt(active_count), daily_delta("tse.active_count", active_count, percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
     if market["error"]:
         st.warning("بخشی از داده دریافت نشد: " + market["error"])
     if symbols.empty:
@@ -470,8 +572,8 @@ def render_tse_tab():
 
     st.markdown("#### پیش‌بینی فردا با فیلتر فشار تقاضا و عرضه")
     demand_col, supply_col = st.columns(2)
-    demand_col.metric("تعداد نمادهای فشار تقاضا", f"{len(pressure_buy):,}")
-    supply_col.metric("تعداد نمادهای فشار عرضه", f"{len(pressure_sell):,}")
+    demand_col.metric("تعداد نمادهای فشار تقاضا", f"{len(pressure_buy):,}", daily_delta("tse.demand_count", len(pressure_buy), percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
+    supply_col.metric("تعداد نمادهای فشار عرضه", f"{len(pressure_sell):,}", daily_delta("tse.supply_count", len(pressure_sell), percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
     if len(pressure_buy) > len(pressure_sell):
         st.success(f"سیگنال فیلتر: صعودی · تقاضا {len(pressure_buy)} نماد در برابر عرضه {len(pressure_sell)} نماد")
     elif len(pressure_sell) > len(pressure_buy):
@@ -492,11 +594,14 @@ def render_tse_tab():
         net_delta = None
         if previous:
             old_date, old_net, old_count = previous
-            net_delta = f"{net - old_net:+,.0f} تومان نسبت به جلسهٔ {old_date}"
-        f1.metric("خالص ورود/خروج پول حقیقی امروز (برآورد)", f"{net:+,.0f} تومان", net_delta)
-        f2.metric("نمادهای با ورود خالص حقیقی", f"{len(inflow_symbols):,}")
-        f3.metric("نمادهای با خروج خالص حقیقی", f"{len(outflow_symbols):,}")
-        f4.metric("سهم نمادهای وروددار", f"{buy_share:.1f}%", f"از {len(flow_symbols):,} نماد دارای داده")
+            if old_net:
+                change_pct = (net - old_net) / abs(old_net) * 100
+                net_delta = f"{change_pct:+.2f}%"
+        f1.metric("خالص ورود/خروج پول حقیقی امروز (میلیارد تومان)", f"{net / 1_000_000_000:+,.2f}", net_delta,
+                  delta_description=f"درصد تغییر جهت‌دار نسبت به جلسهٔ {old_date}" if previous and old_net else "برای محاسبهٔ درصد، خالص روز قبل باید غیرصفر باشد")
+        f2.metric("نمادهای با ورود خالص حقیقی", f"{len(inflow_symbols):,}", daily_delta("tse.inflow_count", len(inflow_symbols), percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
+        f3.metric("نمادهای با خروج خالص حقیقی", f"{len(outflow_symbols):,}", daily_delta("tse.outflow_count", len(outflow_symbols), percentage=False, unit="نماد"), delta_description="تغییر تعداد نسبت به روز قبل")
+        f4.metric("سهم نمادهای وروددار", f"{buy_share:.1f}%", daily_delta("tse.inflow_share", buy_share, percentage=False, unit="واحد درصد"), delta_description="تغییر نسبت به روز قبل")
 
         movers = st.columns(2)
         for col, frame, title, ascending in (
@@ -507,9 +612,9 @@ def render_tse_tab():
             if frame.empty:
                 col.caption("نمادی ثبت نشده است.")
             else:
-                top = frame.assign(flow_display=frame["flow_toman"].map(lambda value: f"{value:+,.0f} تومان"))
+                top = frame.assign(flow_display=frame["flow_toman"].map(lambda value: f"{value / 1_000_000_000:+,.2f}"))
                 top = top.sort_values("flow_toman", ascending=ascending).head(5)
-                col.dataframe(top[["symbol", "flow_display"]].rename(columns={"symbol": "نماد", "flow_display": "جریان خالص حقیقی (برآورد)"}).reset_index(drop=True),
+                col.dataframe(top[["symbol", "flow_display"]].rename(columns={"symbol": "نماد", "flow_display": "جریان خالص حقیقی (میلیارد تومان)"}).reset_index(drop=True),
                               width="stretch", hide_index=True)
         if previous:
             st.caption(f"مقایسهٔ تغییر جریان خالص با جلسهٔ ثبت‌شدهٔ قبل: {old_date}؛ در مبنا {old_count:,} نماد دارای داده بودند.")
