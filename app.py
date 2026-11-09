@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,6 +26,30 @@ html,body,[class*="css"],[data-testid="stAppViewContainer"]{font-family:'Vazirma
 [data-testid="stMetricLabel"],[data-testid="stMetricValue"],[data-testid="stMetricDelta"]{justify-content:flex-start;text-align:right}
 .stTabs [data-baseweb="tab-list"]{direction:rtl;gap:8px}
 h1,h2,h3,p{ text-align:right }
+.st-key-mobile_stock_table,.st-key-mobile_etf_table,.st-key-mobile_inflow_table,.st-key-mobile_outflow_table{display:none}
+.mobile-data-card{background:#142f48;border:1px solid #254d69;border-radius:12px;padding:12px;margin:8px 0;color:#f5f7fa;text-align:right;direction:rtl}
+.mobile-data-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;border-bottom:1px solid #34566e;padding-bottom:8px;margin-bottom:8px}
+.mobile-data-card-head strong{font-size:1.05rem;overflow-wrap:anywhere}
+.mobile-data-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 12px}
+.mobile-data-cell{min-width:0;overflow-wrap:anywhere}
+.mobile-data-label{display:block;color:#b9c9d7;font-size:.76rem;line-height:1.5;margin-bottom:2px}
+.mobile-data-value{display:block;color:#fff;font-size:.91rem;font-weight:600;line-height:1.5;overflow-wrap:anywhere}
+@media(max-width:700px){
+  .block-container{padding:1rem .65rem 1.5rem!important}
+  [data-testid="stHorizontalBlock"]{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:.65rem!important}
+  [data-testid="stHorizontalBlock"]>[data-testid="stColumn"]{width:auto!important;min-width:0!important;max-width:100%!important}
+  [data-testid="stMetric"]{padding:11px!important;min-width:0;overflow:hidden}
+  [data-testid="stMetricValue"]{font-size:clamp(1.2rem,5vw,1.8rem)!important;overflow-wrap:anywhere}
+  [data-testid="stMetricLabel"]{font-size:.82rem!important;line-height:1.45!important}
+  .stTabs [data-baseweb="tab-list"]{overflow-x:auto;white-space:nowrap;scrollbar-width:thin;flex-wrap:nowrap!important}
+  .stTabs [data-baseweb="tab"]{flex:0 0 auto!important;padding-inline:10px!important}
+  .st-key-desktop_stock_table,.st-key-desktop_etf_table,.st-key-desktop_inflow_table,.st-key-desktop_outflow_table{display:none!important}
+  .st-key-mobile_stock_table,.st-key-mobile_etf_table,.st-key-mobile_inflow_table,.st-key-mobile_outflow_table{display:block!important}
+}
+@media(max-width:390px){
+  [data-testid="stHorizontalBlock"]{grid-template-columns:minmax(0,1fr)!important}
+  .mobile-data-grid{grid-template-columns:minmax(0,1fr)!important}
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -439,6 +464,29 @@ def save_flow_snapshot(trade_date: str, net_flow_toman: float, symbol_count: int
         return None
 
 
+def render_responsive_table(frame: pd.DataFrame, *, columns: list[str], title_column: str, desktop_key: str, mobile_key: str):
+    with st.container(key=desktop_key):
+        st.dataframe(frame[columns].reset_index(drop=True), width="stretch", hide_index=True)
+    with st.container(key=mobile_key):
+        for _, row in frame[columns].iterrows():
+            title = escape(str(row.get(title_column, "—")))
+            values = []
+            for column in columns:
+                if column == title_column:
+                    continue
+                value = row[column]
+                shown = "—" if pd.isna(value) else str(value)
+                values.append(
+                    f'<div class="mobile-data-cell"><span class="mobile-data-label">{escape(str(column))}</span>'
+                    f'<span class="mobile-data-value">{escape(shown)}</span></div>'
+                )
+            st.markdown(
+                f'<article class="mobile-data-card"><div class="mobile-data-card-head"><strong>{title}</strong></div>'
+                f'<div class="mobile-data-grid">{"".join(values)}</div></article>',
+                unsafe_allow_html=True,
+            )
+
+
 def render_stock_table(frame: pd.DataFrame, is_etf: bool = False):
     if frame.empty:
         st.info("با فیلتر فعلی نماد واجد شرایطی پیدا نشد.")
@@ -457,7 +505,11 @@ def render_stock_table(frame: pd.DataFrame, is_etf: bool = False):
         columns = ["نام نماد", "سیگنال", "آخرین قیمت (٪)", "قیمت پایانی (٪)", "قدرت خریدار حقیقی", "تعداد معاملات", "NAV ابطال", "اختلاف با NAV ابطال", "امتیاز کل"]
     else:
         columns = ["نام نماد", "سیگنال", "آخرین قیمت (٪)", "قیمت پایانی (٪)", "قدرت خریدار حقیقی", "نسبت حجم به مبنا", "امتیاز کل"]
-    st.dataframe(table[columns].reset_index(drop=True), width="stretch", hide_index=True)
+    render_responsive_table(
+        table, columns=columns, title_column="نام نماد",
+        desktop_key="desktop_etf_table" if is_etf else "desktop_stock_table",
+        mobile_key="mobile_etf_table" if is_etf else "mobile_stock_table",
+    )
 
 
 # ------------------------------ UI sections -------------------------------
@@ -604,9 +656,9 @@ def render_tse_tab():
         f4.metric("سهم نمادهای وروددار", f"{buy_share:.1f}%", daily_delta("tse.inflow_share", buy_share, percentage=False, unit="واحد درصد"), delta_description="تغییر نسبت به روز قبل")
 
         movers = st.columns(2)
-        for col, frame, title, ascending in (
-            (movers[0], inflow_symbols, "بیشترین ورود خالص حقیقی", False),
-            (movers[1], outflow_symbols, "بیشترین خروج خالص حقیقی", True),
+        for col, frame, title, ascending, desktop_key, mobile_key in (
+            (movers[0], inflow_symbols, "بیشترین ورود خالص حقیقی", False, "desktop_inflow_table", "mobile_inflow_table"),
+            (movers[1], outflow_symbols, "بیشترین خروج خالص حقیقی", True, "desktop_outflow_table", "mobile_outflow_table"),
         ):
             col.markdown(f"##### {title}")
             if frame.empty:
@@ -614,8 +666,10 @@ def render_tse_tab():
             else:
                 top = frame.assign(flow_display=frame["flow_toman"].map(lambda value: f"{value / 1_000_000_000:+,.2f}"))
                 top = top.sort_values("flow_toman", ascending=ascending).head(5)
-                col.dataframe(top[["symbol", "flow_display"]].rename(columns={"symbol": "نماد", "flow_display": "جریان خالص حقیقی"}).reset_index(drop=True),
-                              width="stretch", hide_index=True)
+                top = top[["symbol", "flow_display"]].rename(columns={"symbol": "نماد", "flow_display": "جریان خالص حقیقی"})
+                with col:
+                    render_responsive_table(top, columns=["نماد", "جریان خالص حقیقی"], title_column="نماد",
+                                            desktop_key=desktop_key, mobile_key=mobile_key)
         if previous:
             st.caption(f"مقایسهٔ تغییر جریان خالص با جلسهٔ ثبت‌شدهٔ قبل: {old_date}؛ در مبنا {old_count:,} نماد دارای داده بودند.")
         st.caption(f"روش برآورد: (حجم خرید حقیقی − حجم فروش حقیقی) × آخرین قیمت · {market['flow_count']:,} نماد با دادهٔ حقیقی. مقادیر جریان در کارت و جدول بر حسب میلیارد نمایش داده می‌شوند. برآورد، خالص انتقال بین حقیقی و حقوقی است و به‌معنای برداشت وجه از کل بازار نیست.")
