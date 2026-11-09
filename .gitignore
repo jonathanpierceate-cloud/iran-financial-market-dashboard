@@ -6,3 +6,5 @@ market_flow.sqlite3
 *.log
 .streamlit/secrets.toml
 .env
+.vercel/
+.env.local
