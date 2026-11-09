@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+market_flow.sqlite3
+*.log
+.streamlit/secrets.toml
+.env
